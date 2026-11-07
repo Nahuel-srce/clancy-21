@@ -1,11 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
+
 import Intro from "./components/Intro.jsx";
 import Show from "./components/Show.jsx";
 import Finale from "./components/Finale.jsx";
 import Ending from "./components/Ending.jsx";
 import Material from "./components/Material.jsx";
+
 import { Fx, Controls } from "./components/Ui.jsx";
 import { parseName } from "./data.js";
+
 import {
   saveAsset,
   getAssets,
@@ -13,7 +16,25 @@ import {
   deleteMemoryAssets,
 } from "./storage.js";
 
-const EMPTY = { clip: {}, start: {}, memory: {} };
+// Dirección pública de tu bucket de Cloudflare R2.
+const R2_BASE = "https://pub-6917db5282a6438cb5ad15a20af80825.r2.dev";
+
+// Genera las direcciones de los 13 videoclips.
+function remoteClips() {
+  return Object.fromEntries(
+    Array.from({ length: 13 }, (_, i) => {
+      const n = String(i + 1).padStart(2, "0");
+
+      return [i + 1, `${R2_BASE}/${n}-clip.mp4`];
+    }),
+  );
+}
+
+const EMPTY = {
+  clip: remoteClips(),
+  start: {},
+  memory: {},
+};
 
 function readStarts() {
   try {
@@ -29,35 +50,44 @@ export default function App() {
   const [stage, setStage] = useState(
     ["show", "finale", "end"].includes(go) ? go : "intro",
   );
+
   const [run, setRun] = useState(0);
   const [paused, setPaused] = useState(false);
   const [muted, setMuted] = useState(false);
   const [panel, setPanel] = useState(false);
+
   const [media, setMedia] = useState({
     ...EMPTY,
     start: readStarts(),
   });
+
   const [cover, setCover] = useState(null);
   const [storageReady, setStorageReady] = useState(false);
 
-  // Recuperar archivos guardados al abrir o actualizar la página.
+  // Recuperar recuerdos y archivos locales guardados.
+  // Los videoclips de R2 se utilizan como fuente predeterminada.
   useEffect(() => {
     let active = true;
 
     async function restore() {
       try {
         const records = await getAssets();
+
         if (!active) return;
 
         const restored = {
-          clip: {},
+          clip: remoteClips(),
           start: readStarts(),
           memory: {},
         };
 
         records.forEach((record) => {
+          if (!record.blob) return;
+
           const url = URL.createObjectURL(record.blob);
 
+          // Si existe un videoclip local guardado,
+          // se mantiene como reemplazo del remoto.
           if (record.kind === "clip") {
             restored.clip[record.n] = url;
           }
@@ -96,6 +126,7 @@ export default function App() {
   // Buscar la portada de Clancy.
   useEffect(() => {
     const ac = new AbortController();
+
     const timeout = setTimeout(() => ac.abort(), 6000);
 
     fetch(
@@ -121,7 +152,7 @@ export default function App() {
     };
   }, []);
 
-  // Importar varios archivos.
+  // Importar varios archivos desde Material.
   const importFiles = useCallback(
     (files) => {
       if (!storageReady) return files.length;
@@ -160,7 +191,10 @@ export default function App() {
           return;
         }
 
-        assignments.push({ ...r, file });
+        assignments.push({
+          ...r,
+          file,
+        });
       });
 
       setMedia((current) => {
@@ -174,7 +208,9 @@ export default function App() {
           const url = URL.createObjectURL(file);
 
           if (kind === "clip") {
-            if (updated.clip[n]) URL.revokeObjectURL(updated.clip[n]);
+            if (updated.clip[n]?.startsWith("blob:")) {
+              URL.revokeObjectURL(updated.clip[n]);
+            }
 
             updated.clip[n] = url;
 
@@ -188,36 +224,33 @@ export default function App() {
           }
 
           if (kind === "memory") {
-            const memories = [
-              ...(updated.memory[n] || []),
-              { url, type: file.type },
-            ].slice(-2);
+            const memories = [...(updated.memory[n] || [])];
+
+            // Se permiten hasta dos recuerdos por canción.
+            // Si ya hay dos, se reemplaza el segundo.
+            const index = Math.min(memories.length, 1);
+
+            if (memories[index]?.url) {
+              URL.revokeObjectURL(memories[index].url);
+            }
+
+            memories[index] = {
+              url,
+              type: file.type,
+            };
 
             updated.memory[n] = memories;
 
-            deleteMemoryAssets(n)
-              .then(() =>
-                Promise.all(
-                  memories.map((memory, index) => {
-                    const originalFile =
-                      index === memories.length - 1 ? file : null;
-
-                    // El archivo anterior se conserva en el estado,
-                    // pero su Blob se recupera abajo desde IndexedDB.
-                    return originalFile
-                      ? saveAsset({
-                          id: `memory:${n}:${index}`,
-                          kind: "memory",
-                          n,
-                          index,
-                          blob: originalFile,
-                          type: originalFile.type,
-                        })
-                      : Promise.resolve();
-                  }),
-                ),
-              )
-              .catch(console.error);
+            // Guardar solo el recuerdo nuevo.
+            // El anterior no se elimina de IndexedDB.
+            saveAsset({
+              id: `memory:${n}:${index}`,
+              kind: "memory",
+              n,
+              index,
+              blob: file,
+              type: file.type,
+            }).catch(console.error);
           }
         });
 
@@ -232,17 +265,22 @@ export default function App() {
   // Asignar un archivo individual.
   const assign = useCallback(
     (kind, n, file) => {
-      if (!storageReady) return;
+      if (!storageReady || !file) return;
 
       const url = URL.createObjectURL(file);
 
       if (kind === "clip") {
         setMedia((current) => {
-          if (current.clip[n]) URL.revokeObjectURL(current.clip[n]);
+          if (current.clip[n]?.startsWith("blob:")) {
+            URL.revokeObjectURL(current.clip[n]);
+          }
 
           return {
             ...current,
-            clip: { ...current.clip, [n]: url },
+            clip: {
+              ...current.clip,
+              [n]: url,
+            },
           };
         });
 
@@ -259,35 +297,34 @@ export default function App() {
 
       if (kind === "memory") {
         setMedia((current) => {
-          const memories = [
-            ...(current.memory[n] || []),
-            { url, type: file.type },
-          ].slice(-2);
+          const memories = [...(current.memory[n] || [])];
 
-          deleteMemoryAssets(n)
-            .then(() =>
-              Promise.all(
-                memories.map((memory, index) => {
-                  const isNew = memory.url === url;
+          const index = Math.min(memories.length, 1);
 
-                  if (!isNew) return Promise.resolve();
+          if (memories[index]?.url) {
+            URL.revokeObjectURL(memories[index].url);
+          }
 
-                  return saveAsset({
-                    id: `memory:${n}:${index}`,
-                    kind: "memory",
-                    n,
-                    index,
-                    blob: file,
-                    type: file.type,
-                  });
-                }),
-              ),
-            )
-            .catch(console.error);
+          memories[index] = {
+            url,
+            type: file.type,
+          };
+
+          saveAsset({
+            id: `memory:${n}:${index}`,
+            kind: "memory",
+            n,
+            index,
+            blob: file,
+            type: file.type,
+          }).catch(console.error);
 
           return {
             ...current,
-            memory: { ...current.memory, [n]: memories },
+            memory: {
+              ...current.memory,
+              [n]: memories,
+            },
           };
         });
       }
@@ -299,14 +336,23 @@ export default function App() {
   const clear = useCallback((kind, n) => {
     setMedia((current) => {
       if (kind === "clip") {
-        if (current.clip[n]) URL.revokeObjectURL(current.clip[n]);
+        // No eliminamos el videoclip de R2:
+        // al quitar un reemplazo local, vuelve a usarse el remoto.
+        if (current.clip[n]?.startsWith("blob:")) {
+          URL.revokeObjectURL(current.clip[n]);
+        }
 
         deleteAsset(`clip:${n}`).catch(console.error);
 
-        const clips = { ...current.clip };
-        delete clips[n];
+        const clips = {
+          ...current.clip,
+          [n]: remoteClips()[n],
+        };
 
-        return { ...current, clip: clips };
+        return {
+          ...current,
+          clip: clips,
+        };
       }
 
       if (kind === "memory") {
@@ -319,14 +365,17 @@ export default function App() {
         const memories = { ...current.memory };
         delete memories[n];
 
-        return { ...current, memory: memories };
+        return {
+          ...current,
+          memory: memories,
+        };
       }
 
       return current;
     });
   }, []);
 
-  // Guardar el segundo de inicio.
+  // Guardar el segundo de inicio de cada canción.
   const setStart = useCallback((n, value) => {
     setMedia((current) => {
       const starts = { ...current.start };
@@ -339,7 +388,10 @@ export default function App() {
 
       localStorage.setItem("clancy21-starts", JSON.stringify(starts));
 
-      return { ...current, start: starts };
+      return {
+        ...current,
+        start: starts,
+      };
     });
   }, []);
 
